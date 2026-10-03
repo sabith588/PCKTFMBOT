@@ -5,6 +5,8 @@ import logging
 import subprocess
 import httpx
 import sys
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import (
     Update,
@@ -44,6 +46,25 @@ SETTINGS = {
 
 # Temporary cache for pending updates
 PENDING_CODE_UPDATES = {}
+
+# ---------------------------------------------------------
+# Render Health Check Server
+# ---------------------------------------------------------
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        # Silence default HTTP server logging to keep logs clean
+        return
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
 
 # ---------------------------------------------------------
 # Database Setup
@@ -163,7 +184,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔄 Sync Stories Now", callback_data="run_sync")]
     ]
     await update.message.reply_text(
-        f"⚙️ **Admin Control Panel**\n\nStatus: {status}\nLog Channel: `{LOG_CHANNEL_ID}`\n\n💡 *Tip: Upload a `.py` file here to update the bot code using a button.*",
+        f"⚙️ **Admin Control Panel**\n\nStatus: {status}\nLog Channel: `{LOG_CHANNEL_ID}`\n\n💡 *Tip: Send a `.py` file here to trigger code updates.*",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -198,7 +219,6 @@ async def handle_code_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⚠️ Please upload a valid `.py` script.")
         return
 
-    # Cache file ID for update confirmation
     PENDING_CODE_UPDATES[user_id] = doc.file_id
 
     keyboard = [
@@ -207,7 +227,7 @@ async def handle_code_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ]
 
     await update.message.reply_text(
-        f"📦 **New Code Received:** `{doc.file_name}`\n\nClick the button below to apply this update and restart the bot:",
+        f"📦 **New Code File Received:** `{doc.file_name}`\n\nClick the button below to apply this update and restart:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -225,27 +245,26 @@ async def handle_update_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == "apply_code_update":
         file_id = PENDING_CODE_UPDATES.get(user_id)
         if not file_id:
-            await query.edit_message_text("❌ Update session expired. Please re-upload your `.py` file.")
+            await query.edit_message_text("❌ Update session expired. Upload your `.py` file again.")
             return
 
-        await query.edit_message_text("⏳ Downloading new script and overwriting `bot.py`...")
+        await query.edit_message_text("⏳ Downloading new script and updating target file...")
 
         try:
             tg_file = await context.bot.get_file(file_id)
-            target_filename = os.path.basename(__file__) if __file__ else "bot.py"
+            target_filename = os.path.basename(__file__) if __file__ else "main.py"
             
-            # Download and overwrite script
             await tg_file.download_to_drive(target_filename)
 
             await context.bot.send_message(
                 chat_id=user_id,
-                text="✅ **Code Updated Successfully!**\n\nRestarting process now...",
+                text="✅ **Code Updated Successfully!**\n\nRestarting process...",
                 parse_mode="Markdown"
             )
 
             PENDING_CODE_UPDATES.pop(user_id, None)
 
-            # Exit process cleanly so Render/Pydroid host restarts it automatically
+            # Terminate current process; Render will automatically restart the web service
             os._exit(0)
 
         except Exception as e:
@@ -328,6 +347,9 @@ async def process_sync(context: ContextTypes.DEFAULT_TYPE):
 # Main Execution Loop
 # ---------------------------------------------------------
 async def main():
+    # Start background HTTP server for Render health checks
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     token_conv = ConversationHandler(
@@ -343,24 +365,23 @@ async def main():
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(token_conv)
     
-    # Handlers for Remote Code Updates
+    # Handlers for Code Updates
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_code_upload))
     app.add_handler(CallbackQueryHandler(handle_update_button, pattern="^(apply_code_update|cancel_code_update)$"))
 
     app.add_handler(CallbackQueryHandler(run_sync_callback, pattern="^run_sync$"))
     app.add_handler(CallbackQueryHandler(handle_buttons))
 
+    logger.info("Initializing bot and starting polling...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    print("Pocket FM Bot is active and running!")
     while True:
         await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        loop.create_task(main())
-    else:
+    try:
         asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
