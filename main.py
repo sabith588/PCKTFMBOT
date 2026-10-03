@@ -1,205 +1,218 @@
-import logging
-import asyncio
 import os
+import sqlite3
+import asyncio
+import logging
+import subprocess
+import httpx
 import sys
-import aiosqlite
-from playwright.async_api import async_playwright
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
     filters,
 )
 
-# ---------------------------------------------------------------------------
-# Pre-configured Credentials
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Logging & Configuration
+# ---------------------------------------------------------
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 BOT_TOKEN = "8751864548:AAFhkXymbSEgyfT_F20L0u_WD1PzyA9bCR0"
 ADMIN_ID = 8861377143
 LOG_CHANNEL_ID = -1004291729847
-DB_NAME = "users_tokens.db"
 
-# Conversation states
-PHONE, OTP = range(2)
+# States for token entry conversation
+WAITING_TOKEN = 1
 
-# In-memory storage for active browser sessions & pending updates
-USER_SESSIONS = {}
-PENDING_UPDATES = {}
+# Shared runtime state
+SETTINGS = {
+    "pocket_fm_token": None
+}
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+# Temporary cache for pending updates
+PENDING_CODE_UPDATES = {}
 
-
-# ---------------------------------------------------------------------------
-# Database Management
-# ---------------------------------------------------------------------------
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_tokens (
-                user_id INTEGER PRIMARY KEY,
-                phone TEXT NOT NULL,
-                access_token TEXT NOT NULL
-            )
-            """
+# ---------------------------------------------------------
+# Database Setup
+# ---------------------------------------------------------
+def init_db():
+    conn = sqlite3.connect("bot_data.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS episodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            story_id TEXT,
+            story_title TEXT,
+            episode_no INTEGER,
+            episode_title TEXT,
+            file_id TEXT
         )
-        await db.commit()
+    """)
+    conn.commit()
+    conn.close()
 
+init_db()
 
-async def save_token(user_id: int, phone: str, token: str):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            """
-            INSERT INTO user_tokens (user_id, phone, access_token)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                phone = excluded.phone,
-                access_token = excluded.access_token
-            """,
-            (user_id, phone, token),
+# ---------------------------------------------------------
+# 1. /start Command & Story Navigation
+# ---------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    conn = sqlite3.connect("bot_data.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT story_id, story_title FROM episodes")
+    stories = cursor.fetchall()
+    conn.close()
+
+    keyboard = []
+    for story_id, story_title in stories:
+        keyboard.append([InlineKeyboardButton(story_title, callback_data=f"story:{story_id}")])
+
+    if user_id == ADMIN_ID:
+        keyboard.append([InlineKeyboardButton("⚙️ Admin Control Panel", callback_data="open_admin")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    msg_text = "🎧 **Select a Pocket FM Story to listen:**" if stories else "🎧 **Welcome!** No stories synced yet. Use `/admin` to setup."
+
+    await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
+
+# ---------------------------------------------------------
+# 2. Interactive Button Handler
+# ---------------------------------------------------------
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # Open Admin Menu
+    if data == "open_admin":
+        if query.from_user.id != ADMIN_ID:
+            return
+        status = "✅ Connected" if SETTINGS["pocket_fm_token"] else "❌ Not Connected"
+        admin_kb = [
+            [InlineKeyboardButton("🔑 Set Pocket FM Token", callback_data="set_token")],
+            [InlineKeyboardButton("🔄 Sync Stories Now", callback_data="run_sync")],
+            [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]
+        ]
+        await query.edit_message_text(
+            f"⚙️ **Admin Control Panel**\n\nStatus: {status}\nLog Channel: `{LOG_CHANNEL_ID}`",
+            reply_markup=InlineKeyboardMarkup(admin_kb),
+            parse_mode="Markdown"
         )
-        await db.commit()
 
+    # Show Episodes for Selected Story
+    elif data.startswith("story:"):
+        story_id = data.split(":")[1]
+        conn = sqlite3.connect("bot_data.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT episode_no, episode_title, file_id FROM episodes WHERE story_id=?", (story_id,))
+        episodes = cursor.fetchall()
+        conn.close()
 
-# ---------------------------------------------------------------------------
-# Playwright Browser Automation Functions
-# ---------------------------------------------------------------------------
-async def start_browser_login(user_id: int, phone_number: str) -> bool:
-    clean_phone = "".join(filter(str.isdigit, phone_number))
-    if len(clean_phone) > 10:
-        clean_phone = clean_phone[-10:]
+        keyboard = []
+        for ep_no, ep_title, file_id in episodes:
+            keyboard.append([InlineKeyboardButton(f"Ep {ep_no}: {ep_title}", callback_data=f"play:{file_id}")])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")])
 
-    try:
-        pw = await async_playwright().start()
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
+        await query.edit_message_text("📖 **Select an episode:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-        captured_data = {"token": None}
+    # Send Audio File
+    elif data.startswith("play:"):
+        file_id = data.split(":")[1]
+        await query.message.reply_audio(audio=file_id)
 
-        async def handle_response(response):
-            if "verify_otp" in response.url or "auth" in response.url:
-                try:
-                    json_data = await response.json()
-                    token = (
-                        json_data.get("result", {}).get("token") or
-                        json_data.get("accessToken") or
-                        json_data.get("token")
-                    )
-                    if token:
-                        captured_data["token"] = token
-                except Exception:
-                    pass
+    # Return to Main Menu
+    elif data == "main_menu":
+        conn = sqlite3.connect("bot_data.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT story_id, story_title FROM episodes")
+        stories = cursor.fetchall()
+        conn.close()
 
-        page.on("response", handle_response)
-        await page.goto("https://pocketfm.com/login", wait_until="networkidle", timeout=30000)
+        keyboard = [[InlineKeyboardButton(st[1], callback_data=f"story:{st[0]}")] for st in stories]
+        if query.from_user.id == ADMIN_ID:
+            keyboard.append([InlineKeyboardButton("⚙️ Admin Control Panel", callback_data="open_admin")])
 
-        await page.fill("input[type='tel'], input[name='mobile']", clean_phone)
-        await page.click("button[type='submit']")
-        await page.wait_for_timeout(3000)
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        msg_text = "🎧 **Select a Pocket FM Story to listen:**" if stories else "🎧 **Welcome!** No stories synced yet."
+        await query.edit_message_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
 
-        USER_SESSIONS[user_id] = {
-            "pw": pw,
-            "browser": browser,
-            "page": page,
-            "phone": clean_phone,
-            "captured": captured_data
-        }
-        return True
+# ---------------------------------------------------------
+# 3. Admin Command & Manual Token Input
+# ---------------------------------------------------------
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    status = "✅ Connected" if SETTINGS["pocket_fm_token"] else "❌ Not Connected"
+    keyboard = [
+        [InlineKeyboardButton("🔑 Set Pocket FM Token", callback_data="set_token")],
+        [InlineKeyboardButton("🔄 Sync Stories Now", callback_data="run_sync")]
+    ]
+    await update.message.reply_text(
+        f"⚙️ **Admin Control Panel**\n\nStatus: {status}\nLog Channel: `{LOG_CHANNEL_ID}`\n\n💡 *Tip: Upload a `.py` file here to update the bot code using a button.*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
 
-    except Exception as e:
-        logging.error(f"Playwright trigger error: {e}")
-        if user_id in USER_SESSIONS:
-            await USER_SESSIONS[user_id]["browser"].close()
-            await USER_SESSIONS[user_id]["pw"].stop()
-            del USER_SESSIONS[user_id]
-        return False
+async def set_token_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Paste your **Pocket FM Authorization Bearer Token** below:\n\nSend /cancel to exit.")
+    return WAITING_TOKEN
 
+async def save_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    SETTINGS["pocket_fm_token"] = update.message.text.strip()
+    await update.message.reply_text("✅ Pocket FM token saved successfully! Use /admin to sync stories.")
+    return ConversationHandler.END
 
-async def complete_browser_otp(user_id: int, otp: str) -> str | None:
-    session = USER_SESSIONS.get(user_id)
-    if not session:
-        return None
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Action canceled.")
+    return ConversationHandler.END
 
-    page = session["page"]
-    browser = session["browser"]
-    pw = session["pw"]
-    captured = session["captured"]
-
-    try:
-        otp_inputs = await page.query_selector_all("input[type='text'], input[type='number']")
-        if len(otp_inputs) >= len(otp):
-            for i, char in enumerate(otp):
-                await otp_inputs[i].fill(char)
-        else:
-            await page.fill("input[type='text'], input[type='number']", otp)
-
-        submit_btn = await page.query_selector("button[type='submit']")
-        if submit_btn:
-            await submit_btn.click()
-
-        await page.wait_for_timeout(4000)
-
-        if not captured["token"]:
-            token = await page.evaluate(
-                "() => localStorage.getItem('token') || localStorage.getItem('accessToken')"
-            )
-            captured["token"] = token
-
-        return captured["token"]
-
-    except Exception as e:
-        logging.error(f"Playwright OTP verification error: {e}")
-        return None
-    finally:
-        await browser.close()
-        await pw.stop()
-        if user_id in USER_SESSIONS:
-            del USER_SESSIONS[user_id]
-
-
-# ---------------------------------------------------------------------------
-# Self-Updating Handlers (Button Code Updater)
-# ---------------------------------------------------------------------------
-async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------------------------------------------------
+# 4. Remote Code Update via Button
+# ---------------------------------------------------------
+async def handle_code_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
         return
 
     doc = update.message.document
     if not doc.file_name.endswith(".py"):
-        await update.message.reply_text("⚠️ Please send a valid Python file (`.py`).")
+        await update.message.reply_text("⚠️ Please upload a valid `.py` script.")
         return
 
-    # Store file_id in pending updates cache
-    PENDING_UPDATES[user_id] = doc.file_id
+    # Cache file ID for update confirmation
+    PENDING_CODE_UPDATES[user_id] = doc.file_id
 
     keyboard = [
-        [InlineKeyboardButton("🔄 Apply Update & Restart", callback_data="confirm_update")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_update")]
+        [InlineKeyboardButton("🔄 Apply Code Update & Restart", callback_data="apply_code_update")],
+        [InlineKeyboardButton("❌ Cancel Update", callback_data="cancel_code_update")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        f"📄 **New Code File Received:** `{doc.file_name}`\n\n"
-        "Click the button below to overwrite `bot.py` and restart the bot:",
-        reply_markup=reply_markup,
+        f"📦 **New Code Received:** `{doc.file_name}`\n\nClick the button below to apply this update and restart the bot:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
 
-
-async def handle_update_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_update_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -209,159 +222,145 @@ async def handle_update_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     data = query.data
 
-    if data == "confirm_update":
-        file_id = PENDING_UPDATES.get(user_id)
+    if data == "apply_code_update":
+        file_id = PENDING_CODE_UPDATES.get(user_id)
         if not file_id:
-            await query.edit_message_text("❌ Session expired. Please send the code file again.")
+            await query.edit_message_text("❌ Update session expired. Please re-upload your `.py` file.")
             return
 
-        await query.edit_message_text("⏳ Downloading new file and overwriting `bot.py`...")
+        await query.edit_message_text("⏳ Downloading new script and overwriting `bot.py`...")
 
         try:
             tg_file = await context.bot.get_file(file_id)
-            # Overwrite active bot.py script
-            await tg_file.download_to_drive("bot.py")
+            target_filename = os.path.basename(__file__) if __file__ else "bot.py"
+            
+            # Download and overwrite script
+            await tg_file.download_to_drive(target_filename)
 
             await context.bot.send_message(
                 chat_id=user_id,
-                text="✅ **Update Applied Successfully!**\n\nRestarting process now...",
+                text="✅ **Code Updated Successfully!**\n\nRestarting process now...",
                 parse_mode="Markdown"
             )
 
-            # Clean memory & terminate process (Render automatically restarts worker)
-            PENDING_UPDATES.pop(user_id, None)
+            PENDING_CODE_UPDATES.pop(user_id, None)
+
+            # Exit process cleanly so Render/Pydroid host restarts it automatically
             os._exit(0)
 
         except Exception as e:
-            logging.error(f"Error updating script: {e}")
-            await context.bot.send_message(chat_id=user_id, text=f"❌ Failed to apply update: `{e}`", parse_mode="Markdown")
-
-    elif data == "cancel_update":
-        PENDING_UPDATES.pop(user_id, None)
-        await query.edit_message_text("❌ Code update cancelled.")
-
-
-# ---------------------------------------------------------------------------
-# Bot Handlers
-# ---------------------------------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "👋 Welcome! Send /login to fetch and store your Pocket FM access token automatically.\n\n"
-        "👑 **Admin:** Upload a `.py` file anytime to update bot source code via inline buttons."
-    )
-    return ConversationHandler.END
-
-
-async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "📱 Please enter your 10-digit Pocket FM mobile number (e.g., 9024102902):"
-    )
-    return PHONE
-
-
-async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    phone = update.message.text.strip()
-    user_id = update.effective_user.id
-    
-    await update.message.reply_text(f"⏳ Opening browser & sending OTP to `{phone}`...", parse_mode="Markdown")
-
-    success = await start_browser_login(user_id, phone)
-    if success:
-        await update.message.reply_text("✅ OTP sent! Please reply with the code you received:")
-        return OTP
-    else:
-        await update.message.reply_text("❌ Failed to initiate login process. Please send /login to try again.")
-        return ConversationHandler.END
-
-
-async def handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    otp = update.message.text.strip()
-    user = update.effective_user
-    user_id = user.id
-
-    await update.message.reply_text("⏳ Verifying OTP in real browser...")
-
-    phone = USER_SESSIONS.get(user_id, {}).get("phone", "N/A")
-    token = await complete_browser_otp(user_id, otp)
-
-    if token:
-        await save_token(user_id, phone, token)
-        await update.message.reply_text(
-            f"🎉 **Success! Token Retrieved & Saved.**\n\n`{token}`",
-            parse_mode="Markdown"
-        )
-
-        try:
-            log_msg = (
-                f"🔑 **New Token Extracted**\n"
-                f"👤 **User:** [{user.first_name}](tg://user?id={user.id}) (`{user.id}`)\n"
-                f"📱 **Phone:** `{phone}`\n"
-                f"🎫 **Token:** `{token}`"
-            )
+            logger.error(f"Failed to apply code update: {e}")
             await context.bot.send_message(
-                chat_id=LOG_CHANNEL_ID,
-                text=log_msg,
+                chat_id=user_id,
+                text=f"❌ **Update Failed:** `{e}`",
                 parse_mode="Markdown"
             )
-        except Exception as e:
-            logging.error(f"Failed to send log to channel: {e}")
 
-    else:
-        await update.message.reply_text("❌ Invalid OTP or token extraction failed. Try /login again.")
+    elif data == "cancel_code_update":
+        PENDING_CODE_UPDATES.pop(user_id, None)
+        await query.edit_message_text("❌ Code update canceled.")
 
-    return ConversationHandler.END
+# ---------------------------------------------------------
+# 5. Sync Background Pipeline
+# ---------------------------------------------------------
+async def run_sync_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    if user_id in USER_SESSIONS:
-        await USER_SESSIONS[user_id]["browser"].close()
-        await USER_SESSIONS[user_id]["pw"].stop()
-        del USER_SESSIONS[user_id]
-    await update.message.reply_text("Operation cancelled.")
-    return ConversationHandler.END
-
-
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not SETTINGS["pocket_fm_token"]:
+        await query.edit_message_text("❌ No token saved! Set your Pocket FM token first.")
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM user_tokens") as cursor:
-            count = (await cursor.fetchone())[0]
+    await query.edit_message_text("⏳ Sync processing... Uploading episodes to storage channel.")
+    asyncio.create_task(process_sync(context))
 
-    await update.message.reply_text(f"📊 Total Saved Tokens: `{count}`", parse_mode="Markdown")
+async def process_sync(context: ContextTypes.DEFAULT_TYPE):
+    mock_episodes = [
+        {
+            "story_id": "secret_millionaire",
+            "story_title": "Secret Millionaire",
+            "ep_no": 1,
+            "ep_title": "The Encounter",
+            "url": "https://example.com/stream1.m3u8"
+        }
+    ]
 
+    for ep in mock_episodes:
+        temp_file = "temp_episode.mp3"
+        try:
+            conn = sqlite3.connect("bot_data.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM episodes WHERE story_id=? AND episode_no=?", (ep["story_id"], ep["ep_no"]))
+            exists = cursor.fetchone()
+            conn.close()
 
-# ---------------------------------------------------------------------------
-# Main Routine
-# ---------------------------------------------------------------------------
-def main():
-    asyncio.run(init_db())
+            if exists:
+                continue
 
+            cmd = ["ffmpeg", "-y", "-i", ep["url"], "-acodec", "libmp3lame", "-ab", "128k", temp_file]
+            subprocess.run(cmd, check=True)
+
+            with open(temp_file, "rb") as audio:
+                sent = await context.bot.send_audio(
+                    chat_id=LOG_CHANNEL_ID,
+                    audio=audio,
+                    caption=f"{ep['story_title']} - Ep {ep['ep_no']}: {ep['ep_title']}"
+                )
+            
+            conn = sqlite3.connect("bot_data.db")
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO episodes (story_id, story_title, episode_no, episode_title, file_id)
+                VALUES (?, ?, ?, ?, ?)
+            """, (ep["story_id"], ep["story_title"], ep["ep_no"], ep["ep_title"], sent.audio.file_id))
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            logger.error(f"Error processing {ep['ep_title']}: {e}")
+        finally:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+    await context.bot.send_message(chat_id=ADMIN_ID, text="🎉 **Sync complete!** All new stories are saved to the bot database.")
+
+# ---------------------------------------------------------
+# Main Execution Loop
+# ---------------------------------------------------------
+async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("login", login_command)],
+    token_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(set_token_start, pattern="^set_token$")],
         states={
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone)],
-            OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_otp)],
+            WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_token)]
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", admin_stats))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(token_conv)
     
-    # Document uploader and button callback handlers for Code Updates
-    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_document_upload))
-    app.add_handler(CallbackQueryHandler(handle_update_callback))
+    # Handlers for Remote Code Updates
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_code_upload))
+    app.add_handler(CallbackQueryHandler(handle_update_button, pattern="^(apply_code_update|cancel_code_update)$"))
 
-    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(run_sync_callback, pattern="^run_sync$"))
+    app.add_handler(CallbackQueryHandler(handle_buttons))
 
-    print("Bot running with button-based remote code updates...")
-    app.run_polling()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
 
+    print("Pocket FM Bot is active and running!")
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    main()
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        loop.create_task(main())
+    else:
+        asyncio.run(main())
